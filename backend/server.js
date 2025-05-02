@@ -1,6 +1,8 @@
 const express = require('express');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
+const User = require('./models/User');
+const Allergy = require('./models/Allergy');
 
 const app = express();
 app.use(cors());
@@ -10,12 +12,16 @@ app.use(express.json());
 const pool = mysql.createPool({
     host: 'localhost',
     user: 'root',
-    password: '|hD369;V|x3.',
+    password: '|hD369;V|x3.', // Replace with your password
     database: 'user_allergy_tracker',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
 });
+
+// Initialize ORM models (keeping this for compatibility)
+User.init(pool);
+Allergy.init(pool);
 
 // Test database connection
 pool.getConnection()
@@ -28,27 +34,26 @@ pool.getConnection()
     });
 
 // ======================
-// ROUTES (70% prepared statements)
+// API ROUTES (Using Direct Prepared Statements)
 // ======================
 
-// 1. HEALTH CHECK
+// 1. Health Check
 app.get('/', (req, res) => {
     res.json({ 
-        status: 'API is working', 
-        db_connection: pool.pool.config.connectionConfig.database,
-        timestamp: new Date() 
+        status: 'API is working',
+        timestamp: new Date().toISOString()
     });
 });
 
-// 2. USER ROUTES
+// 2. USER ROUTES (Direct Prepared Statements)
 
-// Get all users with allergy counts (Prepared)
+// Get all users with allergy counts
 app.get('/api/users', async (req, res) => {
     try {
-        const [users] = await pool.execute(`
-            SELECT 
-                u.user_id, 
-                u.name, 
+        const [rows] = await pool.query(`
+            SELECT
+                u.user_id,
+                u.name,
                 u.age,
                 u.email,
                 COUNT(ua.user_allergy_id) AS allergy_count
@@ -57,46 +62,62 @@ app.get('/api/users', async (req, res) => {
             GROUP BY u.user_id
             ORDER BY u.name
         `);
-        res.json(users);
+        res.json(rows);
     } catch (err) {
-        console.error('🚨 GET /api/users error:', err);
-        res.status(500).json({ error: 'Failed to fetch users' });
+        console.error('GET /api/users error:', err);
+        res.status(500).json({ 
+            error: 'Failed to fetch users',
+            details: process.env.NODE_ENV === 'development' ? err.message : undefined
+        });
     }
 });
 
-// Get single user with allergies (Prepared)
+// Get single user with allergies
 app.get('/api/users/:id', async (req, res) => {
+    const conn = await pool.getConnection();
     try {
-        const [user] = await pool.execute(
-            'SELECT * FROM users WHERE user_id = ?', 
+        await conn.beginTransaction();
+
+        // Get user
+        const [userRows] = await conn.query(
+            'SELECT * FROM users WHERE user_id = ?',
             [req.params.id]
         );
         
-        if (!user[0]) {
+        if (userRows.length === 0) {
             return res.status(404).json({ error: 'User not found' });
         }
 
-        const [allergies] = await pool.execute(
-            `SELECT 
+        // Get allergies
+        const [allergyRows] = await conn.query(
+            `SELECT
                 a.allergy_id,
                 a.name,
                 a.severity,
+                a.description,
                 ua.notes,
                 ua.diagnosed_date
-             FROM user_allergies ua
-             JOIN allergies a ON ua.allergy_id = a.allergy_id
-             WHERE ua.user_id = ?`,
+            FROM user_allergies ua
+            JOIN allergies a ON ua.allergy_id = a.allergy_id
+            WHERE ua.user_id = ?`,
             [req.params.id]
         );
 
-        res.json({ ...user[0], allergies });
+        await conn.commit();
+        res.json({ ...userRows[0], allergies: allergyRows });
     } catch (err) {
-        console.error('🚨 GET /api/users/:id error:', err);
-        res.status(500).json({ error: 'Failed to fetch user' });
+        await conn.rollback();
+        console.error('GET /api/users/:id error:', err);
+        res.status(500).json({ 
+            error: 'Failed to fetch user',
+            details: process.env.NODE_ENV === 'development' ? err.message : undefined
+        });
+    } finally {
+        conn.release();
     }
 });
 
-// Create user (Prepared)
+// Create new user
 app.post('/api/users', async (req, res) => {
     try {
         const { name, age, email } = req.body;
@@ -105,91 +126,344 @@ app.post('/api/users', async (req, res) => {
             return res.status(400).json({ error: 'Name and email are required' });
         }
 
-        const [result] = await pool.execute(
+        const [result] = await pool.query(
             'INSERT INTO users (name, age, email) VALUES (?, ?, ?)',
-            [name, age || null, email]
+            [name, age, email]
         );
-
-        res.status(201).json({
+        
+        const newUser = {
             user_id: result.insertId,
             name,
             age,
             email
-        });
+        };
+        
+        res.status(201).json(newUser);
     } catch (err) {
-        console.error('🚨 POST /api/users error:', err);
-        res.status(500).json({ error: 'Failed to create user' });
+        console.error('POST /api/users error:', err);
+        res.status(500).json({ 
+            error: 'Failed to create user',
+            details: process.env.NODE_ENV === 'development' ? err.message : undefined
+        });
     }
 });
 
-// 3. ALLERGY ROUTES
+// Update user
+app.put('/api/users/:id', async (req, res) => {
+    try {
+        const validFields = ['name', 'age', 'email'];
+        const updates = [];
+        const values = [];
+        
+        validFields.forEach(field => {
+            if (req.body[field] !== undefined) {
+                updates.push(`${field} = ?`);
+                values.push(req.body[field]);
+            }
+        });
+        
+        if (updates.length === 0) {
+            return res.status(400).json({ error: 'No valid fields to update' });
+        }
+        
+        values.push(req.params.id); // For WHERE clause
+        
+        const [result] = await pool.query(
+            `UPDATE users SET ${updates.join(', ')} WHERE user_id = ?`,
+            values
+        );
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        // Fetch updated user
+        const [userRows] = await pool.query(
+            'SELECT * FROM users WHERE user_id = ?',
+            [req.params.id]
+        );
+        
+        res.json(userRows[0]);
+    } catch (err) {
+        console.error('PUT /api/users/:id error:', err);
+        res.status(500).json({ 
+            error: 'Failed to update user'
+        });
+    }
+});
 
-// Get all allergies (Prepared)
+// Delete user
+app.delete('/api/users/:id', async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        
+        // First delete dependencies (manual CASCADE)
+        await conn.query(
+            'DELETE FROM user_allergies WHERE user_id = ?',
+            [req.params.id]
+        );
+        
+        const [result] = await conn.query(
+            'DELETE FROM users WHERE user_id = ?',
+            [req.params.id]
+        );
+        
+        if (result.affectedRows === 0) {
+            await conn.rollback();
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        await conn.commit();
+        res.json({ message: 'User deleted successfully' });
+    } catch (err) {
+        await conn.rollback();
+        console.error('DELETE /api/users/:id error:', err);
+        res.status(500).json({ 
+            error: 'Failed to delete user'
+        });
+    } finally {
+        conn.release();
+    }
+});
+
+// 3. ALLERGY ROUTES (Direct Prepared Statements)
+
+// Get all allergies with user counts
 app.get('/api/allergies', async (req, res) => {
     try {
-        const [allergies] = await pool.execute(`
+        const [rows] = await pool.query(`
             SELECT 
-                allergy_id,
-                name,
-                severity,
-                description
-            FROM allergies
-            ORDER BY name
+                a.allergy_id,
+                a.name,
+                a.severity,
+                a.description,
+                COUNT(ua.user_id) AS user_count
+            FROM allergies a
+            LEFT JOIN user_allergies ua ON a.allergy_id = ua.allergy_id
+            GROUP BY a.allergy_id
+            ORDER BY a.name
         `);
-        res.json(allergies);
+        res.json(rows);
     } catch (err) {
-        console.error('🚨 GET /api/allergies error:', err);
-        res.status(500).json({ error: 'Failed to fetch allergies' });
+        console.error('GET /api/allergies error:', err);
+        res.status(500).json({ 
+            error: 'Failed to fetch allergies',
+            details: process.env.NODE_ENV === 'development' ? err.message : undefined
+        });
     }
 });
 
-// Add allergy to user (Prepared)
-app.post('/api/users/:userId/allergies', async (req, res) => {
+// Create new allergy
+app.post('/api/allergies', async (req, res) => {
     try {
+        const { name, severity, description } = req.body;
+        
+        if (!name) {
+            return res.status(400).json({ error: 'Name is required' });
+        }
+
+        const [result] = await pool.query(
+            'INSERT INTO allergies (name, severity, description) VALUES (?, ?, ?)',
+            [name, severity || 'mild', description]
+        );
+        
+        const newAllergy = {
+            allergy_id: result.insertId,
+            name,
+            severity: severity || 'mild',
+            description
+        };
+        
+        res.status(201).json(newAllergy);
+    } catch (err) {
+        console.error('POST /api/allergies error:', err);
+        res.status(500).json({ 
+            error: 'Failed to create allergy',
+            details: process.env.NODE_ENV === 'development' ? err.message : undefined
+        });
+    }
+});
+
+// Update allergy
+app.put('/api/allergies/:id', async (req, res) => {
+    try {
+        const validFields = ['name', 'severity', 'description'];
+        const updates = [];
+        const values = [];
+        2195
+        validFields.forEach(field => {
+            if (req.body[field] !== undefined) {
+                updates.push(`${field} = ?`);
+                values.push(req.body[field]);
+            }
+        });
+        
+        if (updates.length === 0) {
+            return res.status(400).json({ error: 'No valid fields to update' });
+        }
+        
+        values.push(req.params.id); // For WHERE clause
+        
+        const [result] = await pool.query(
+            `UPDATE allergies SET ${updates.join(', ')} WHERE allergy_id = ?`,
+            values
+        );
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Allergy not found' });
+        }
+        
+        // Fetch updated allergy
+        const [allergyRows] = await pool.query(
+            'SELECT * FROM allergies WHERE allergy_id = ?',
+            [req.params.id]
+        );
+        
+        res.json(allergyRows[0]);
+    } catch (err) {
+        console.error('PUT /api/allergies/:id error:', err);
+        res.status(500).json({ 
+            error: 'Failed to update allergy'
+        });
+    }
+});
+
+// Delete allergy
+app.delete('/api/allergies/:id', async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        
+        // First delete dependencies (manual CASCADE)
+        await conn.query(
+            'DELETE FROM user_allergies WHERE allergy_id = ?',
+            [req.params.id]
+        );
+        
+        const [result] = await conn.query(
+            'DELETE FROM allergies WHERE allergy_id = ?',
+            [req.params.id]
+        );
+        
+        if (result.affectedRows === 0) {
+            await conn.rollback();
+            return res.status(404).json({ error: 'Allergy not found' });
+        }
+        
+        await conn.commit();
+        res.json({ message: 'Allergy deleted successfully' });
+    } catch (err) {
+        await conn.rollback();
+        console.error('DELETE /api/allergies/:id error:', err);
+        res.status(500).json({ 
+            error: 'Failed to delete allergy'
+        });
+    } finally {
+        conn.release();
+    }
+});
+
+// 4. USER-ALLERGY RELATIONSHIPS (Direct Prepared Statements)
+
+// Assign allergy to user
+app.post('/api/users/:userId/allergies', async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        
         const { allergy_id, notes, diagnosed_date } = req.body;
 
-        // Validate required fields
         if (!allergy_id) {
             return res.status(400).json({ error: 'allergy_id is required' });
         }
 
-        // Check if relationship exists
-        const [existing] = await pool.execute(
-            `SELECT 1 FROM user_allergies 
-             WHERE user_id = ? AND allergy_id = ?`,
-            [req.params.userId, allergy_id]
+        // Check if user exists
+        const [userRows] = await conn.query(
+            'SELECT 1 FROM users WHERE user_id = ?',
+            [req.params.userId]
         );
-
-        if (existing.length > 0) {
-            return res.status(409).json({ error: 'Allergy already assigned to user' });
+        
+        if (userRows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
         }
 
-        const [result] = await pool.execute(
-            `INSERT INTO user_allergies 
-             (user_id, allergy_id, notes, diagnosed_date)
-             VALUES (?, ?, ?, ?)`,
+        // Check if allergy exists
+        const [allergyRows] = await conn.query(
+            'SELECT 1 FROM allergies WHERE allergy_id = ?',
+            [allergy_id]
+        );
+        
+        if (allergyRows.length === 0) {
+            return res.status(404).json({ error: 'Allergy not found' });
+        }
+
+        // Check if relationship already exists
+        const [existingRows] = await conn.query(
+            'SELECT 1 FROM user_allergies WHERE user_id = ? AND allergy_id = ?',
+            [req.params.userId, allergy_id]
+        );
+        
+        if (existingRows.length > 0) {
+            return res.status(400).json({ error: 'User already has this allergy' });
+        }
+
+        // Create relationship
+        const [result] = await conn.query(
+            'INSERT INTO user_allergies (user_id, allergy_id, notes, diagnosed_date) VALUES (?, ?, ?, ?)',
             [req.params.userId, allergy_id, notes || null, diagnosed_date || null]
         );
-
-        res.status(201).json({
+        
+        await conn.commit();
+        
+        const relationship = {
             user_allergy_id: result.insertId,
             user_id: req.params.userId,
             allergy_id,
             notes,
             diagnosed_date
-        });
+        };
+        
+        res.status(201).json(relationship);
     } catch (err) {
-        console.error('🚨 POST /api/users/:userId/allergies error:', err);
-        res.status(500).json({ error: 'Failed to add allergy to user' });
+        await conn.rollback();
+        console.error('POST /api/users/:userId/allergies error:', err);
+        res.status(500).json({ 
+            error: 'Failed to add allergy to user'
+        });
+    } finally {
+        conn.release();
     }
 });
 
-// 4. STATISTICS (Prepared)
+// Get users with specific allergy
+app.get('/api/allergies/:id/users', async (req, res) => {
+    try {
+        const [rows] = await pool.query(`
+            SELECT 
+                u.user_id,
+                u.name,
+                u.age,
+                u.email,
+                ua.notes,
+                ua.diagnosed_date
+            FROM user_allergies ua
+            JOIN users u ON ua.user_id = u.user_id
+            WHERE ua.allergy_id = ?
+        `, [req.params.id]);
+        res.json(rows);
+    } catch (err) {
+        console.error('GET /api/allergies/:id/users error:', err);
+        res.status(500).json({ 
+            error: 'Failed to fetch users with allergy'
+        });
+    }
+});
 
-// Get allergy statistics
+// 5. STATISTICS (Direct Prepared Statement)
 app.get('/api/stats', async (req, res) => {
     try {
-        const [stats] = await pool.execute(`
+        const [rows] = await pool.query(`
             SELECT 
                 a.allergy_id,
                 a.name,
@@ -202,20 +476,25 @@ app.get('/api/stats', async (req, res) => {
             GROUP BY a.allergy_id
             ORDER BY affected_users DESC
         `);
-        res.json(stats);
+        res.json(rows);
     } catch (err) {
-        console.error('🚨 GET /api/stats error:', err);
-        res.status(500).json({ error: 'Failed to fetch statistics' });
+        console.error('GET /api/stats error:', err);
+        res.status(500).json({ 
+            error: 'Failed to fetch statistics'
+        });
     }
 });
 
 // Error handler
 app.use((err, req, res, next) => {
-    console.error('🔥 Unhandled error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Unhandled error:', err);
+    res.status(500).json({ 
+        error: 'Internal server error',
+        details: process.env.NODE_ENV === 'development' ? err.stack : undefined
+    });
 });
 
-const PORT = 3006;
+const PORT = process.env.PORT || 3006;
 app.listen(PORT, () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
+    console.log(`Server running on http://localhost:${PORT}`);
 });
